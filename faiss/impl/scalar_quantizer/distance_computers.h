@@ -13,6 +13,7 @@
 #include <faiss/utils/simd_levels.h>
 #include <faiss/utils/simdlib.h>
 #include <faiss/utils/bf16.h>
+#include <faiss/utils/fp16.h>
 
 namespace faiss {
 
@@ -80,6 +81,76 @@ struct DCBF16IPDpbf16 : SQDistanceComputer {
     float query_to_code(const uint8_t* code) const final {
         const auto* c = (const uint16_t*)code;
         return compute_code_ip_bf16(qbf16.data(), c);
+    }
+};
+
+#endif
+
+#if defined(__AVX512FP16__)
+
+// Fast path for QT_fp16 + IP on CPUs with AVX512_FP16.
+//
+// Key idea: quantize query to FP16 once in set_query(), then compute inner
+// products using VFMADDCFPH/PH against FP16-coded vectors.
+//
+// Notes:
+// - Only enabled when __AVX512FP16__ is available (e.g., -march=sapphirerapids).
+// - Requires d % 32 == 0 to use fmadd_ph cleanly (32 fp16 elements per op).
+template <SIMDLevel SL>
+struct DCFP16IPFmadd : SQDistanceComputer {
+    using Sim = SimilarityIP<SL>;
+
+    QuantizerFP16<SL> quant;
+    std::vector<uint16_t> qfp16;
+
+    DCFP16IPFmadd(size_t d, const std::vector<float>& trained)
+            : quant(d, trained), qfp16(d) {}
+
+    void set_query(const float* x) final {
+        q = x;
+        // Match QuantizerFP16::encode_vector semantics (encode_fp16()).
+        for (size_t i = 0; i < quant.d; i++) {
+            qfp16[i] = encode_fp16(x[i]);
+        }
+    }
+
+    FAISS_ALWAYS_INLINE float compute_code_ip_fp16(
+            const uint16_t* a,
+            const uint16_t* b) const {
+        // d is expected to be multiple of 32 for this fast path.
+        // Use FP16 accumulator to stay in FP16 domain throughout the loop
+        __m512h acc_fp16 = _mm512_setzero_ph();
+        for (size_t i = 0; i < quant.d; i += 32) {
+            // Data is already in FP16 format (uint16_t), load directly as __m512h
+            const __m512h a_fp16 = _mm512_loadu_ph((const void*)(a + i));
+            const __m512h b_fp16 = _mm512_loadu_ph((const void*)(b + i));
+            // FMA in FP16: acc = a * b + acc (all in FP16 domain)
+            acc_fp16 = _mm512_fmadd_ph(a_fp16, b_fp16, acc_fp16);
+        }
+        // Convert the accumulated FP16 result to FP32 for final summation
+        // Split 32 FP16 into two halves (16 elements each)
+        // First cast __m512h to __m512i, then extract low and high halves
+        __m512i acc_i = _mm512_castph_si512(acc_fp16);
+        __m256i acc_low_256i = _mm512_castsi512_si256(acc_i);
+        __m256i acc_high_256i = _mm512_extracti64x4_epi64(acc_i, 1);
+        // Convert each 16 FP16 to 16 FP32
+        __m512 acc_low_fp32 = _mm512_cvtph_ps(acc_low_256i);
+        __m512 acc_high_fp32 = _mm512_cvtph_ps(acc_high_256i);
+        // Sum each half, then combine results
+        float sum_low = _mm512_reduce_add_ps(acc_low_fp32);
+        float sum_high = _mm512_reduce_add_ps(acc_high_fp32);
+        return sum_low + sum_high;
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        const auto* code1 = (const uint16_t*)(codes + i * code_size);
+        const auto* code2 = (const uint16_t*)(codes + j * code_size);
+        return compute_code_ip_fp16(code1, code2);
+    }
+
+    float query_to_code(const uint8_t* code) const final {
+        const auto* c = (const uint16_t*)code;
+        return compute_code_ip_fp16(qfp16.data(), c);
     }
 };
 

@@ -153,6 +153,15 @@ SQDistanceComputer* select_distance_computer_body(
                     SL2>(d, trained);
 
         case ScalarQuantizer::QT_fp16:
+#if defined(__AVX512FP16__)
+            if constexpr (
+                    SL2 == SIMDLevel::AVX512 &&
+                    std::is_same_v<Sim, SimilarityIP<SIMDLevel::AVX512>>) {
+                if (d % 32 == 0) {
+                    return new DCFP16IPFmadd<SL2>(d, trained);
+                }
+            }
+#endif
             return new DCTemplate<QuantizerFP16<SL2>, Sim, SL2>(d, trained);
 
         case ScalarQuantizer::QT_bf16:
@@ -293,6 +302,18 @@ InvertedListScanner* sq_select_InvertedListScanner<THE_LEVEL_TO_DISPATCH>(
                         Similarity,
                         SL2>>();
             case ScalarQuantizer::QT_fp16:
+#if defined(__AVX512FP16__)
+                if constexpr (
+                        SL2 == SIMDLevel::AVX512 &&
+                        std::is_same_v<
+                                Similarity,
+                                SimilarityIP<SIMDLevel::AVX512>>) {
+                    if (d % 32 == 0) {
+                        return scan.template
+                        operator()<DCFP16IPFmadd<SL2>>();
+                    }
+                }
+#endif
                 return scan.template
                 operator()<DCTemplate<QuantizerFP16<SL2>, Similarity, SL2>>();
             case ScalarQuantizer::QT_bf16:

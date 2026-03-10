@@ -163,7 +163,8 @@ SIMDLevel SIMDConfig::auto_detect_simd_level() {
                              : "=a"(eax1), "=b"(ebx1), "=c"(ecx1), "=d"(edx1)
                              : "a"(eax1), "c"(ecx1));
                 bool has_avx512_bf16 = (eax1 & (1 << 5)) != 0;
-                if (has_avx512_bf16) {
+                bool has_avx512_fp16 = (eax1 & (1 << 23)) != 0;
+                if (has_avx512_bf16 && has_avx512_fp16) {
                     detected_level = SIMDLevel::AVX512_SPR;
                     supported_simd_levels |=
                             (1 << static_cast<int>(SIMDLevel::AVX512_SPR));
