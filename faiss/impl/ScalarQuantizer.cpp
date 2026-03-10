@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <type_traits>
 
 #include <faiss/impl/platform_macros.h>
 
@@ -1666,6 +1667,104 @@ struct DCTemplate<Quantizer, Similarity, 8> : SQDistanceComputer {
 };
 #endif
 
+#if defined(__AVX512BF16__)
+
+struct DCBF16IPDpbf16 : SQDistanceComputer {
+    using Sim = SimilarityIP<16>;
+
+    QuantizerBF16<16> quant;
+    std::vector<uint16_t> qbf16;
+
+    DCBF16IPDpbf16(size_t d, const std::vector<float>& trained)
+            : quant(d, trained), qbf16(d) {}
+
+    void set_query(const float* x) final {
+        q = x;
+        for (size_t i = 0; i < quant.d; i++) {
+            qbf16[i] = encode_bf16(x[i]);
+        }
+    }
+
+    FAISS_ALWAYS_INLINE float compute_code_ip_bf16(
+            const uint16_t* a,
+            const uint16_t* b) const {
+        __m512 acc = _mm512_setzero_ps();
+        for (size_t i = 0; i < quant.d; i += 32) {
+            const __m512i va = _mm512_loadu_si512((const void*)(a + i));
+            const __m512i vb = _mm512_loadu_si512((const void*)(b + i));
+            const __m512bh bha = (__m512bh)va;
+            const __m512bh bhb = (__m512bh)vb;
+            acc = _mm512_dpbf16_ps(acc, bha, bhb);
+        }
+        return _mm512_reduce_add_ps(acc);
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        const auto* code1 = (const uint16_t*)(codes + i * code_size);
+        const auto* code2 = (const uint16_t*)(codes + j * code_size);
+        return compute_code_ip_bf16(code1, code2);
+    }
+
+    float query_to_code(const uint8_t* code) const final {
+        const auto* c = (const uint16_t*)code;
+        return compute_code_ip_bf16(qbf16.data(), c);
+    }
+};
+
+#endif
+
+#if defined(__AVX512FP16__)
+
+struct DCFP16IPFmadd : SQDistanceComputer {
+    using Sim = SimilarityIP<16>;
+
+    QuantizerFP16<16> quant;
+    std::vector<uint16_t> qfp16;
+
+    DCFP16IPFmadd(size_t d, const std::vector<float>& trained)
+            : quant(d, trained), qfp16(d) {}
+
+    void set_query(const float* x) final {
+        q = x;
+        for (size_t i = 0; i < quant.d; i++) {
+            qfp16[i] = encode_fp16(x[i]);
+        }
+    }
+
+    FAISS_ALWAYS_INLINE float compute_code_ip_fp16(
+            const uint16_t* a,
+            const uint16_t* b) const {
+        __m512h acc_fp16 = _mm512_setzero_ph();
+        for (size_t i = 0; i < quant.d; i += 32) {
+            const __m512h a_fp16 = _mm512_loadu_ph((const void*)(a + i));
+            const __m512h b_fp16 = _mm512_loadu_ph((const void*)(b + i));
+            acc_fp16 = _mm512_fmadd_ph(a_fp16, b_fp16, acc_fp16);
+        }
+        
+        __m512i acc_i = _mm512_castph_si512(acc_fp16);
+        __m256i acc_low_256i = _mm512_castsi512_si256(acc_i);
+        __m256i acc_high_256i = _mm512_extracti64x4_epi64(acc_i, 1);
+        __m512 acc_low_fp32 = _mm512_cvtph_ps(acc_low_256i);
+        __m512 acc_high_fp32 = _mm512_cvtph_ps(acc_high_256i);
+        float sum_low = _mm512_reduce_add_ps(acc_low_fp32);
+        float sum_high = _mm512_reduce_add_ps(acc_high_fp32);
+        return sum_low + sum_high;
+    }
+
+    float symmetric_dis(idx_t i, idx_t j) override {
+        const auto* code1 = (const uint16_t*)(codes + i * code_size);
+        const auto* code2 = (const uint16_t*)(codes + j * code_size);
+        return compute_code_ip_fp16(code1, code2);
+    }
+
+    float query_to_code(const uint8_t* code) const final {
+        const auto* c = (const uint16_t*)code;
+        return compute_code_ip_fp16(qfp16.data(), c);
+    }
+};
+
+#endif
+
 /*******************************************************************
  * DistanceComputerByte: computes distances in the integer domain
  *******************************************************************/
@@ -1941,10 +2040,20 @@ SQDistanceComputer* select_distance_computer(
                     SIMDWIDTH>(d, trained);
 
         case ScalarQuantizer::QT_fp16:
+#if defined(__AVX512FP16__)
+            if (SIMDWIDTH == 16 && Sim::metric_type == METRIC_INNER_PRODUCT && d % 32 == 0) {
+                return new DCFP16IPFmadd(d, trained);
+            }
+#endif
             return new DCTemplate<QuantizerFP16<SIMDWIDTH>, Sim, SIMDWIDTH>(
                     d, trained);
 
         case ScalarQuantizer::QT_bf16:
+#if defined(__AVX512BF16__)
+            if (SIMDWIDTH == 16 && Sim::metric_type == METRIC_INNER_PRODUCT && d % 32 == 0) {
+                return new DCBF16IPDpbf16(d, trained);
+            }
+#endif
             return new DCTemplate<QuantizerBF16<SIMDWIDTH>, Sim, SIMDWIDTH>(
                     d, trained);
 
@@ -2407,11 +2516,25 @@ InvertedListScanner* sel1_InvertedListScanner(
                     QuantizerTemplateScaling::NON_UNIFORM>(
                     sq, quantizer, store_pairs, sel, r);
         case ScalarQuantizer::QT_fp16:
+#if defined(__AVX512FP16__)
+            if constexpr (SIMDWIDTH == 16 && Similarity::metric_type == METRIC_INNER_PRODUCT) {
+                if (sq->d % 32 == 0) {
+                    return sel2_InvertedListScanner<DCFP16IPFmadd>(sq, quantizer, store_pairs, sel, r);
+                }
+            }
+#endif
             return sel2_InvertedListScanner<DCTemplate<
                     QuantizerFP16<SIMDWIDTH>,
                     Similarity,
                     SIMDWIDTH>>(sq, quantizer, store_pairs, sel, r);
         case ScalarQuantizer::QT_bf16:
+#if defined(__AVX512BF16__)
+            if constexpr (SIMDWIDTH == 16 && Similarity::metric_type == METRIC_INNER_PRODUCT) {
+                if (sq->d % 32 == 0) {
+                    return sel2_InvertedListScanner<DCBF16IPDpbf16>(sq, quantizer, store_pairs, sel, r);
+                }
+            }
+#endif
             return sel2_InvertedListScanner<DCTemplate<
                     QuantizerBF16<SIMDWIDTH>,
                     Similarity,
